@@ -5,7 +5,7 @@ import dataclasses
 from numbers import Real
 
 
-def gen_new_opcode(instrs, code_options, keys, frame):
+def gen_new_opcode(instrs, code_options, keys):
     bytecode, lnotab = assemble(instrs, code_options["co_firstlineno"])
     code_options["co_lnotab"] = lnotab
     code_options["co_code"] = bytecode
@@ -28,17 +28,46 @@ def assemble(instructions, firstlineno):
     for instr in instructions:
         # set lnotab
         if instr.starts_line is not None:
-            line_offset = max(-128, min(instr.starts_line - cur_line, 127))
-            bytecode_offset_offset = max(0, min(len(code) - cur_bytecode, 255))
-            assert line_offset != 0 or bytecode_offset_offset != 0
+            line_offset = instr.starts_line - cur_line
+            bytecode_offset = len(code) - cur_bytecode
+
             cur_line = instr.starts_line
             cur_bytecode = len(code)
-            lnotab.extend((bytecode_offset_offset, line_offset))
+
+            lnotab.extend(modify_lnotab(bytecode_offset, line_offset))
 
         # get bytecode
         arg = instr.arg or 0
         code.extend((instr.opcode, arg & 0xFF))
+
     return bytes(code), bytes(lnotab)
+
+def to_byte(num):
+    if num < 0:
+        num += 256      #  -1 => 255
+    return num
+
+def modify_lnotab(byte_offset, line_offset):
+    if byte_offset > 127:
+        ret = []
+        while byte_offset > 127:
+            ret.extend((127, 0))
+            byte_offset -= 127
+        # line_offset might > 127, call recursively
+        ret.extend(modify_lnotab(byte_offset, line_offset))
+        return ret
+
+    if line_offset > 127:
+        # here byte_offset < 127
+        ret = [byte_offset, 127]
+        line_offset -= 127
+        while line_offset > 0:
+            ret.extend((0, line_offset))
+            line_offset -=  127
+        return ret
+
+    # both < 127
+    return [to_byte(byte_offset), to_byte(line_offset)]
 
 
 # TODO: need to update

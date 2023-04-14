@@ -1,8 +1,21 @@
 import paddle
-from .symbolic_trace import SymbolicTraceContext
-from .statement_ir import Symbol
-from .utils import Singleton, no_eval_frame
-from .infer_meta import infer_meta, MetaInfo
+
+from .symbolic.symbolic_context import SymbolicTraceContext
+from .symbolic.statement_ir import Symbol
+from .utils import Singleton, no_eval_frame, is_paddle_api, is_fallback_api, log, count_if, map_if
+from .opcode_translator import eval_frame_callback
+from .infer_meta import infer_meta, MetaInfo, InferMetaCache
+from .opcode_translator import ConvertGuard
+
+def method_with_fallback(func):
+    @no_eval_frame
+    def fallback_inner(self, *args, **kwargs):
+        value = SymbolicTraceContext().start_compile(
+            ProxyTensorContext(), output=self
+        )
+        ret = func(value, *args, **kwargs)
+        return ret
+    return fallback_inner
 
 # global variables
 @Singleton
@@ -23,15 +36,29 @@ class ProxyTensorContext:
         #TODO(id may have collision)
         name = SymbolicTraceContext().new_varname()
         proxy_tensor = ProxyTensor(name, MetaInfo.from_tensor(tensor))
-        self.runtime_name_to_proxy_tensor[name] = proxy_tensor
-        self.runtime_proxy_tensor_to_name[id(proxy_tensor)] = name 
         self.tensor_to_proxy_tensor[id(tensor)] = proxy_tensor
         proxy_tensor.set_value(tensor)
         return proxy_tensor
 
+    def bind_name_to_proxy_tensor(self, name, proxy_tensor):
+        self.runtime_name_to_proxy_tensor[name] = proxy_tensor
+        self.runtime_proxy_tensor_to_name[id(proxy_tensor)] = name
+
+    def clear_proxy_tensor_by_name(self, name):
+        log(3, f"[GC] trying to GC {name}\n")
+        proxy_tensor = self.runtime_name_to_proxy_tensor[name]
+        proxy_tensor_id = id(proxy_tensor)
+        has_value = proxy_tensor.value() is not None
+        eager_tensor_id = id(proxy_tensor.value())
+
+        del self.runtime_name_to_proxy_tensor[name]
+        del self.runtime_proxy_tensor_to_name[proxy_tensor_id]
+        if has_value and eager_tensor_id in self.tensor_to_proxy_tensor:
+            del self.tensor_to_proxy_tensor[eager_tensor_id]
+        log(3, f"[GC] {name} GCed\n")
+
     def get_runtime(self):
         return self.runtime_name_to_proxy_tensor
-
 
 
 class ProxyTensor:
@@ -39,7 +66,15 @@ class ProxyTensor:
         self.name = name
         self.meta = meta
         self.value_ = None
+        self._proxy_tensor_ = True
+        ProxyTensorContext().bind_name_to_proxy_tensor(name, self)
 
+    @property
+    def shape(self):
+        # TODO(xiongkun) consider dynamic shape.
+        return self.meta.shape
+
+    @no_eval_frame
     def set_value(self, value):
         """
         value is a eager tensor. 
@@ -47,41 +82,91 @@ class ProxyTensor:
         """
         self.value_ = value
 
-    def value(self):
-        return self.value_
-
-    def __add__(self, other):
-        # later we will use variable shape inference to infer the shape of the output
-        return self.call_method("__add__", self, other)
-
-    def __radd__(self, other):
-        # later we will use variable shape inference to infer the shape of the output
-        return self.call_method("__radd__", self, other)
-
-    def __sub__(self, other):
-        # later we will use variable shape inference to infer the shape of the output
-        return self.call_method("__sub__", self, other)
-
-    def __rsub__(self, other):
-        # later we will use variable shape inference to infer the shape of the output
-        return self.call_method("__rsub__", self, other)
+    @no_eval_frame
+    def clear_value(self):
+        self.value_ = None
 
     @no_eval_frame
+    def value(self):
+        return self.value_
+    
+    @no_eval_frame
+    def __add__(self, other):
+        return self.call_method("__add__", self, other)
+
+    @no_eval_frame
+    def __gt__(self, other):
+        return self.call_method("__gt__", self, other)
+
+    @no_eval_frame
+    def __lt__(self, other):
+        return self.call_method("__lt__", self, other)
+
+    @no_eval_frame
+    def __eq__(self, other):
+        return self.call_method("__lt__", self, other)
+
+    @no_eval_frame
+    def __mul__(self, other):
+        return self.call_method("__mul__", self, other)
+
+    @no_eval_frame
+    def __radd__(self, other):
+        return self.call_method("__radd__", self, other)
+
+    @no_eval_frame
+    def __sub__(self, other):
+        return self.call_method("__sub__", self, other)
+
+    @no_eval_frame
+    def __rsub__(self, other):
+        return self.call_method("__rsub__", self, other)
+
+    @method_with_fallback
     def __bool__(self):
-        # TODO: (too ugly, need to be refactored)
-        SymbolicTraceContext().start_compile(ProxyTensorContext().get_runtime())
-        assert self.value() is not None
-        return bool(self.value())
+        return bool(self)
+
+    @method_with_fallback
+    def __int__(self):
+        return int(self)
+
+    @method_with_fallback
+    def __iter__(self):
+        # if we don't use a ProxyIterator, the eager tensor iter will put
+        # in the stack. Calling in eval_frame_callback will cause errors.
+        class ProxyIterator:
+            def __init__(self, eager_iter):
+                self.eager_tensor_iter = eager_iter
+
+            @no_eval_frame # important
+            def __next__(self):
+                return next(self.eager_tensor_iter)
+        return ProxyIterator(iter(self))
+
+    #TODO(xiongkun): cause error ????, why ?
+    #@method_with_fallback
+    #def __str__(self):
+        #return self.value().__str__()
+
+    #@method_with_fallback
+    #def __repr__(self):
+        #return self.value().__repr__()
+
+    @method_with_fallback
+    def numpy(self):
+        return self.numpy()
 
     @staticmethod
     def call_method(method_name, *args):
         args = convert_arguments(args)
-        if method_name in [ "__add__", "__radd__", "__sub__", "__rsub__" ]:
-            metas = convert_to_meta(args)
-            meta = infer_meta(method_name, *metas)
-            result = ProxyTensor(SymbolicTraceContext().new_varname(), meta)
-            SymbolicTraceContext().call_METHOD(method_name, inputs=convert_to_symbol(args), outputs=convert_to_symbol(result)) # symbolic only contain symbols.
-            return result
+        metas = convert_to_meta(args)
+        meta = infer_meta(method_name, *metas)
+        result = ProxyTensor(SymbolicTraceContext().new_varname(), meta)
+        SymbolicTraceContext().call_METHOD(
+            method_name, 
+            inputs=(convert_to_symbol(args), {}), 
+            outputs=convert_to_symbol(result)) # symbolic only contain symbols.
+        return result
 
 @no_eval_frame
 def convert_to_meta(inputs):
@@ -118,21 +203,37 @@ def convert_arguments(inputs):
         return x
     return paddle.utils.map_structure(func, inputs)
 
-
 @no_eval_frame
-def paddle_api_wrapper(func):
+def callable_wrapper(func):
     @no_eval_frame
-    def wrapper(*args): 
-        args = convert_arguments(args)
-        # TODO(xiokgun): multi-output support.
-        # TODO(xiokgun): may have python buildin object inside metas.
-        # TODO(xiokgun): 4 kinds of python arguments. support it !!
-        if func in [ paddle.add, paddle.subtract, paddle.nn.functional.relu ]:
+    def wrapper(*args, **kwargs): 
+        args, kwargs = convert_arguments(args), convert_arguments(kwargs) 
+        if is_fallback_api(func):
+            # fallback api, fallback first and call this api.
+            if count_if([args, kwargs], pred=lambda x: isinstance(x, ProxyTensor)) > 0:
+                args, kwargs = SymbolicTraceContext().start_compile(
+                    ProxyTensorContext(), output=[args, kwargs])
+            # call function on eager tensor.
+            return func(*args, **kwargs)
+
+        elif is_paddle_api(func):
+            # not fallback api, start symbolic trace.
+            # TODO(xiokgun): multi-output support.
+            # TODO(xiokgun): may have python buildin object inside metas.
+            # TODO(xiokgun): 4 kinds of python arguments. support it !!
+            log(3, f"call paddle.api : {func.__name__}", "\n")
             metas = convert_to_meta(args)
-            meta = infer_meta(func, *metas)
+            kwmetas = convert_to_meta(kwargs)
+            meta = InferMetaCache()(func, *metas, **kwmetas)
             result = ProxyTensor(SymbolicTraceContext().new_varname(), meta)
-            SymbolicTraceContext().call_API(func, inputs=convert_to_symbol(args), outputs=convert_to_symbol(result)) # symbolic only contain symbols.
+            inputs_symbols = (convert_to_symbol(args), convert_to_symbol(kwargs))
+            log(3, f"         inputs : {inputs_symbols}", "\n")
+            SymbolicTraceContext().call_API(
+                func, 
+                inputs=inputs_symbols,
+                outputs=convert_to_symbol(result)) # symbolic only contain symbols.
             return result
-        retval = func(*args)
-        return retval
+
+        else: 
+            pass
     return wrapper

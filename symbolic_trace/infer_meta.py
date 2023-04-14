@@ -1,7 +1,18 @@
+import dataclasses
 import paddle
 from paddle.fluid.framework import Program
+from paddle.utils import flatten
 
-from .utils import NameGenerator, Singleton, no_eval_frame
+from .utils import NameGenerator, Singleton, no_eval_frame, meta_str, Cache
+
+
+@Singleton
+class InferMetaCache(Cache):
+    def key_fn(self, *args, **kwargs):
+        return hash((tuple(flatten(args)), tuple(kwargs.keys()), tuple(flatten(kwargs))))
+
+    def value_fn(self, *args, **kwargs):
+        return infer_meta(*args, **kwargs)
 
 
 class MetaInfo: 
@@ -15,7 +26,16 @@ class MetaInfo:
         return MetaInfo(tensor.shape, tensor.dtype, tensor.stop_gradient)
     
     def __repr__(self):
-        return f"shape: {self.shape},  dtype: {self.dtype},  stop_gradient: {self.stop_gradient}"
+        return meta_str(self.shape, self.dtype, self.stop_gradient)
+
+    def __eq__(self, meta):
+        shape_eq = (self.shape == meta.shape)
+        dtype_eq = (self.dtype == meta.dtype)
+        stop_gradient_eq = (self.stop_gradient == meta.stop_gradient)
+        return shape_eq and dtype_eq and stop_gradient_eq
+
+    def __hash__(self):
+        return hash((tuple(self.shape), self.dtype, self.stop_gradient))
 
 
 @Singleton
@@ -46,22 +66,15 @@ class VariableCreator:
             self.var_cache[var_feature_name] = self.new_var(meta)
         return self.var_cache[var_feature_name]
 
-    def infer_meta(self, func, *args):
+    def infer_meta(self, func, *args, **kwargs):
         paddle.enable_static()
-        args = convert_to_variable(args)
+        args, kwargs = convert_to_variable(*args, **kwargs)
 
         with paddle.static.program_guard(self.main_program, self.startup_program):
             if isinstance(func, str):
-                if func == '__add__':
-                    out = args[0] + args[1]
-                elif func == '__radd__':
-                    out = args[1] + args[0]
-                elif func == '__sub__':
-                    out = args[0] - args[1]
-                elif func == '__rsub__':
-                    out =  args[1] - args[0]
+                out = getattr(args[0], func)(*args[1:], **kwargs)
             else:
-                out = func(*args)
+                out = func(*args, **kwargs)
 
         out = MetaInfo(
             list(out.shape),
@@ -73,14 +86,16 @@ class VariableCreator:
         return out
 
 
-def convert_to_variable(inputs):
+def convert_to_variable(*args, **kwargs):
     def func(x):
         if isinstance(x, MetaInfo):
             return VariableCreator().get_variable(x)
         return x
-    return paddle.utils.map_structure(func, inputs)
+    return (paddle.utils.map_structure(func, args), 
+            paddle.utils.map_structure(func, kwargs))
 
 
 @no_eval_frame
-def infer_meta(func, *args):
-    return VariableCreator().infer_meta(func, *args)
+def infer_meta(func, *args, **kwargs):
+    return VariableCreator().infer_meta(func, *args, **kwargs)
+
